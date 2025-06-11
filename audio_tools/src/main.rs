@@ -1,8 +1,9 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::sync::{Arc, Mutex};
+use cpal::{Device, SampleFormat, Stream};
 use eframe::{egui, App, Frame};
-use egui::{Color32, Context, Pos2, Rangef, Rect, Shape, Slider};
+use egui::{ComboBox, Context, Rangef, Slider};
 use egui_plot::{Line, Plot};
 use pitch_detection::detector::mcleod::McLeodDetector;
 use pitch_detection::detector::PitchDetector;
@@ -65,11 +66,38 @@ struct AudioApp {
 
     custom_range_active: bool,
     custom_range: Rangef,
-    freq_preset: FreqRangePreset
+    freq_preset: FreqRangePreset,
+    input_devices: Vec<Device>,
+    selected_device_index: usize,
+    previous_selected_index: usize,
+    device_names: Vec<String>,
+    current_stream:Option<Stream>,
+
+    gen_frequency: f32,
+    gen_amplitude: f32,
+    gen_phase: f32,
+    gen_enabled: bool,
+
+    gen_sample_rate: u32,
+}
+
+fn list_input_devices() -> Vec<cpal::Device> {
+    let host = cpal::default_host();
+    host.input_devices()
+        .unwrap()
+        .collect()
+}
+
+fn get_device_names(devices: &[cpal::Device]) -> Vec<String> {
+    devices.iter()
+        .map(|d| d.name().unwrap_or_else(|_| "Unknown".to_string()))
+        .collect()
 }
 
 impl AudioApp {
     fn new(audio_buffer: Arc<Mutex<SharedAudioBuffer>>, sample_rate: f32) -> Self {
+        let input_devices = list_input_devices();
+        let device_names = get_device_names(&input_devices);
         Self {
             audio_buffer,
             fft_output: vec![0.0; FFT_SIZE / 2],
@@ -82,20 +110,43 @@ impl AudioApp {
             custom_range_active: false,
             custom_range: Rangef::new(0.0, sample_rate / 2.0),
             freq_preset: FreqRangePreset::All,
+            input_devices,
+            device_names,
+            selected_device_index: 0,
+            previous_selected_index: 0,
+            current_stream: None,
+
+            gen_frequency: 440.0,
+            gen_amplitude: 0.5,
+            gen_phase: 0.0,
+            gen_enabled: false,
+
+            gen_sample_rate: 48000,
         }
+    }
+
+    fn apply_window(samples: &[f32]) -> Vec<f32> {
+        samples.iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                let w = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (samples.len() - 1) as f32).cos());
+                x * w
+            })
+            .collect()
     }
 
     fn process_fft(&mut self) {
         let audio_buf = self.audio_buffer.lock().unwrap();
-        let mut buffer: Vec<Complex<f32>> = audio_buf.samples.iter()
+        let windowed = Self::apply_window(&audio_buf.samples);
+        let mut buffer: Vec<Complex<f32>> = windowed.iter()
             .map(|&f| Complex { re: f, im: 0.0 })
             .collect();
 
         let fft = self.planner.plan_fft_forward(FFT_SIZE);
         fft.process(&mut buffer);
 
-        for i in 0..FFT_SIZE / 2 {
-            self.fft_output[i] = buffer[i].norm();
+        for i in 0..FFT_SIZE /2 {
+            self.fft_output[i] = buffer[i].norm() / FFT_SIZE as f32;
         }
     }
 
@@ -110,13 +161,62 @@ impl AudioApp {
             None
         }
     }
+    
+
+    fn start_stream_for_selected_device(&mut self) {
+        let device = &self.input_devices[self.selected_device_index];
+        let config = device.default_input_config().unwrap();
+
+        let stream = match config.sample_format() {
+            SampleFormat::F32 => self.build_input_stream::<f32>(device, &config.into()),
+            SampleFormat::I16 => self.build_input_stream::<i16>(device, &config.into()),
+            SampleFormat::U16 => self.build_input_stream::<u16>(device, &config.into()),
+            _ => {
+                eprintln!("Unsupported sample format: {:?}", config.sample_format());
+                return;
+            }
+        }.expect("Unsupported sample format");
+
+        stream.play().expect("Failed to play stream");
+        self.current_stream = Some(stream);
+    }
+
+    fn build_input_stream<T: cpal::Sample + Send + 'static>(&self, device: &Device, config: &cpal::StreamConfig, ) -> Result<Stream, cpal::BuildStreamError> {
+        let audio_buffer = Arc::clone(&self.audio_buffer);
+
+        device.build_input_stream(
+            config,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                let mut buf = audio_buffer.lock().unwrap();
+                buf.update(data);
+            },
+            move |err| eprintln!("Stream error: {}", err),
+            None,
+        )
+    }
 }
 
 impl App for AudioApp {
     fn update(&mut self, ctx: &Context, _frame: &mut Frame) {
+
+        if self.selected_device_index != self.previous_selected_index {
+            self.current_stream = None;
+            self.start_stream_for_selected_device();
+            self.previous_selected_index = self.selected_device_index;
+        }
+        
         self.process_fft();
 
         egui::CentralPanel::default().show(ctx, |ui| {
+
+            ComboBox::from_id_salt("input_device_selector")
+                .selected_text(&self.device_names[self.selected_device_index])
+                .show_ui(ui, |ui| {
+                    for (i, name) in self.device_names.iter().enumerate() {
+                        ui.selectable_value(&mut self.selected_device_index, i, name);
+                    }
+                });
+            
             ui.horizontal(|ui| {
                 ui.label("Zoom Onde :");
                 ui.add(Slider::new(&mut self.waveform_zoom, 0.1..=5.0).logarithmic(true));
@@ -132,7 +232,7 @@ impl App for AudioApp {
                 }
 
                 ui.label("Plage de fréquences :");
-                egui::ComboBox::from_id_source("freq_preset")
+                egui::ComboBox::from_id_salt("freq_preset")
                     .selected_text(self.freq_preset.label())
                     .show_ui(ui, |ui| {
                         for preset in [
@@ -146,6 +246,7 @@ impl App for AudioApp {
                     });
             });
 
+            ui.separator();
             ui.separator();
 
             egui::CollapsingHeader::new("Forme d'onde").default_open(true).show(ui, |ui| {
@@ -176,6 +277,7 @@ impl App for AudioApp {
                     });
             });
 
+            ui.separator();
             ui.separator();
 
             egui::CollapsingHeader::new("Spectre FFT").default_open(true).show(ui, |ui| {
@@ -224,7 +326,8 @@ impl App for AudioApp {
                     .enumerate()
                     .map(|(i, &v)| {
                         let freq = (start_idx + i) as f32 * freq_resolution;
-                        [freq as f64, (v.log10().max(-3.0) + 3.0) as f64]
+                        let db = 20.0 * v.max(1e-10).log10();
+                        [freq as f64, db as f64]
                     })
                     .collect();
 
@@ -236,10 +339,39 @@ impl App for AudioApp {
                         plot_ui.line(Line::new("spectrum", spectrum_points));
                     });
 
-                if let Some((freq, note)) = self.detect_pitch() {
-                    ui.label(format!("Note dominante: {} ({:.1} Hz)", note, freq));
-                }
+                // if let Some((freq, note)) = self.detect_pitch() {
+                //     ui.label(format!("Note dominante: {} ({:.1} Hz)", note, freq));
+                // }
             });
+
+            ui.separator();
+            ui.separator();
+
+            if self.gen_enabled {
+                let sample_rate = self.gen_sample_rate as f32;
+                let freq = self.gen_frequency;
+                let amp = self.gen_amplitude;
+
+                let n = 512;
+                let mut samples = Vec::with_capacity(n);
+                for i in 0..n {
+                    let sample = amp * (2.0 * std::f32::consts::PI * freq * (i as f32 / sample_rate) + self.gen_phase).sin();
+                    samples.push(sample);
+                }
+
+                self.gen_phase += 2.0 * std::f32::consts::PI * freq * (n as f32 / sample_rate);
+                self.gen_phase %= 2.0 * std::f32::consts::PI;
+
+                self.audio_buffer.lock().unwrap().update(&samples);
+            }
+            
+            egui::CollapsingHeader::new("Gen freq")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.checkbox(&mut self.gen_enabled, "Enable generator");
+                    ui.add(egui::Slider::new(&mut self.gen_frequency, 1.0..=20000.0).step_by(1.0).text("Frequency (Hz)"));
+                    ui.add(egui::Slider::new(&mut self.gen_amplitude, 0.0..=1.0).text("Amplitude"));
+                });
         });
 
         ctx.request_repaint_after(std::time::Duration::from_millis((16.0 / self.speed_factor) as u64));
@@ -264,7 +396,7 @@ fn main() -> Result<(), anyhow::Error> {
     let device = host.default_input_device().expect("Pas de micro détecté");
     let config = device.default_input_config()?;
     let sample_rate = config.sample_rate().0 as f32;
-
+    
     let err_fn = |err| eprintln!("Erreur audio: {}", err);
 
     let stream = device.build_input_stream(
